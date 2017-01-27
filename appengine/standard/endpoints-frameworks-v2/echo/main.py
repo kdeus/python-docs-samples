@@ -24,9 +24,18 @@ from protorpc import remote
 
 
 # [START messages]
-class Echo(messages.Message):
+class EchoRequest(messages.Message):
+    content = messages.StringField(1)
+
+
+class EchoResponse(messages.Message):
     """A proto Message that contains a simple string field."""
     content = messages.StringField(1)
+
+
+ECHO_RESOURCE = endpoints.ResourceContainer(
+    EchoRequest,
+    n=messages.IntegerField(2, default=1))
 # [END messages]
 
 
@@ -35,21 +44,45 @@ class Echo(messages.Message):
 class EchoApi(remote.Service):
 
     @endpoints.method(
-        # This method takes an Echo message.
-        Echo,
+        # This method takes a ResourceContainer defined above.
+        ECHO_RESOURCE,
         # This method returns an Echo message.
-        Echo,
+        EchoResponse,
         path='echo',
         http_method='POST',
         name='echo')
     def echo(self, request):
-        return Echo(content=request.content)
+        output_content = ' '.join([request.content] * request.n)
+        return EchoResponse(content=output_content)
+
+    @endpoints.method(
+        # This method takes a ResourceContainer defined above.
+        ECHO_RESOURCE,
+        # This method returns an Echo message.
+        EchoResponse,
+        path='echo/{n}',
+        http_method='POST',
+        name='echo_path_parameter')
+    def echo_path_parameter(self, request):
+        output_content = ' '.join([request.content] * request.n)
+        return EchoResponse(content=output_content)
+
+    @endpoints.method(
+        # This method takes a ResourceContainer defined above.
+        message_types.VoidMessage,
+        # This method returns an Echo message.
+        EchoResponse,
+        path='echo/getApiKey',
+        http_method='GET',
+        name='echo_api_key')
+    def echo_api_key(self, request):
+        return EchoResponse(content=request.get_unrecognized_field_info('key'))
 
     @endpoints.method(
         # This method takes an empty request body.
         message_types.VoidMessage,
         # This method returns an Echo message.
-        Echo,
+        EchoResponse,
         path='echo/getUserEmail',
         http_method='GET',
         # Require auth tokens to have the following scopes to access this API.
@@ -62,7 +95,7 @@ class EchoApi(remote.Service):
         # raise 401 Unauthorized.
         if not user:
             raise endpoints.UnauthorizedException
-        return Echo(content=user.email())
+        return EchoResponse(content=user.email())
 # [END echo_api]
 
 

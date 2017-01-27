@@ -17,16 +17,18 @@
 from __future__ import division
 
 import contextlib
+import functools
 import re
 import signal
 import sys
-import threading
 
-from google.cloud import credentials
-from google.cloud.speech.v1beta1 import cloud_speech_pb2 as cloud_speech
+
+import google.auth
+import google.auth.transport.grpc
+import google.auth.transport.requests
+from google.cloud.grpc.speech.v1beta1 import cloud_speech_pb2
 from google.rpc import code_pb2
-from grpc.beta import implementations
-from grpc.framework.interfaces.face import face
+import grpc
 import pyaudio
 from six.moves import queue
 
@@ -43,25 +45,16 @@ SPEECH_SCOPE = 'https://www.googleapis.com/auth/cloud-platform'
 
 
 def make_channel(host, port):
-    """Creates an SSL channel with auth credentials from the environment."""
-    # In order to make an https call, use an ssl channel with defaults
-    ssl_channel = implementations.ssl_channel_credentials(None, None, None)
-
+    """Creates a secure channel with auth credentials from the environment."""
     # Grab application default credentials from the environment
-    creds = credentials.get_credentials().create_scoped([SPEECH_SCOPE])
-    # Add a plugin to inject the creds into the header
-    auth_header = (
-        'Authorization',
-        'Bearer ' + creds.get_access_token().access_token)
-    auth_plugin = implementations.metadata_call_credentials(
-        lambda _, cb: cb([auth_header], None),
-        name='google_creds')
+    credentials, _ = google.auth.default(scopes=[SPEECH_SCOPE])
 
-    # compose the two together for both ssl and google auth
-    composite_channel = implementations.composite_channel_credentials(
-        ssl_channel, auth_plugin)
+    # Create a secure channel using the credentials.
+    http_request = google.auth.transport.requests.Request()
+    target = '{}:{}'.format(host, port)
 
-    return implementations.secure_channel(host, port, composite_channel)
+    return google.auth.transport.grpc.secure_authorized_channel(
+        credentials, http_request, target)
 
 
 def _audio_data_generator(buff):
@@ -73,13 +66,10 @@ def _audio_data_generator(buff):
         A chunk of data that is the aggregate of all chunks of data in `buff`.
         The function will block until at least one data chunk is available.
     """
-    while True:
-        # Use a blocking get() to ensure there's at least one chunk of data
-        chunk = buff.get()
-        if not chunk:
-            # A falsey value indicates the stream is closed.
-            break
-        data = [chunk]
+    stop = False
+    while not stop:
+        # Use a blocking get() to ensure there's at least one chunk of data.
+        data = [buff.get()]
 
         # Now consume whatever other data's still buffered.
         while True:
@@ -87,23 +77,29 @@ def _audio_data_generator(buff):
                 data.append(buff.get(block=False))
             except queue.Empty:
                 break
+
+        # `None` in the buffer signals that the audio stream is closed. Yield
+        # the final bit of the buffer and exit the loop.
+        if None in data:
+            stop = True
+            data.remove(None)
+
         yield b''.join(data)
 
 
-def _fill_buffer(audio_stream, buff, chunk):
+def _fill_buffer(buff, in_data, frame_count, time_info, status_flags):
     """Continuously collect data from the audio stream, into the buffer."""
-    try:
-        while True:
-            buff.put(audio_stream.read(chunk))
-    except IOError:
-        # This happens when the stream is closed. Signal that we're done.
-        buff.put(None)
+    buff.put(in_data)
+    return None, pyaudio.paContinue
 
 
 # [START audio_stream]
 @contextlib.contextmanager
 def record_audio(rate, chunk):
     """Opens a recording stream in a context manager."""
+    # Create a thread-safe buffer of audio data
+    buff = queue.Queue()
+
     audio_interface = pyaudio.PyAudio()
     audio_stream = audio_interface.open(
         format=pyaudio.paInt16,
@@ -111,23 +107,18 @@ def record_audio(rate, chunk):
         # https://goo.gl/z757pE
         channels=1, rate=rate,
         input=True, frames_per_buffer=chunk,
+        # Run the audio stream asynchronously to fill the buffer object.
+        # This is necessary so that the input device's buffer doesn't overflow
+        # while the calling thread makes network requests, etc.
+        stream_callback=functools.partial(_fill_buffer, buff),
     )
-
-    # Create a thread-safe buffer of audio data
-    buff = queue.Queue()
-
-    # Spin up a separate thread to buffer audio data from the microphone
-    # This is necessary so that the input device's buffer doesn't overflow
-    # while the calling thread makes network requests, etc.
-    fill_buffer_thread = threading.Thread(
-        target=_fill_buffer, args=(audio_stream, buff, chunk))
-    fill_buffer_thread.start()
 
     yield _audio_data_generator(buff)
 
     audio_stream.stop_stream()
     audio_stream.close()
-    fill_buffer_thread.join()
+    # Signal the _audio_data_generator to finish
+    buff.put(None)
     audio_interface.terminate()
 # [END audio_stream]
 
@@ -144,7 +135,7 @@ def request_stream(data_stream, rate, interim_results=True):
     """
     # The initial request must contain metadata about the stream, so the
     # server knows how to interpret it.
-    recognition_config = cloud_speech.RecognitionConfig(
+    recognition_config = cloud_speech_pb2.RecognitionConfig(
         # There are a bunch of config options you can specify. See
         # https://goo.gl/KPZn97 for the full list.
         encoding='LINEAR16',  # raw 16-bit signed LE samples
@@ -153,20 +144,30 @@ def request_stream(data_stream, rate, interim_results=True):
         # for a list of supported languages.
         language_code='en-US',  # a BCP-47 language tag
     )
-    streaming_config = cloud_speech.StreamingRecognitionConfig(
+    streaming_config = cloud_speech_pb2.StreamingRecognitionConfig(
         interim_results=interim_results,
         config=recognition_config,
     )
 
-    yield cloud_speech.StreamingRecognizeRequest(
+    yield cloud_speech_pb2.StreamingRecognizeRequest(
         streaming_config=streaming_config)
 
     for data in data_stream:
         # Subsequent requests can all just have the content
-        yield cloud_speech.StreamingRecognizeRequest(audio_content=data)
+        yield cloud_speech_pb2.StreamingRecognizeRequest(audio_content=data)
 
 
 def listen_print_loop(recognize_stream):
+    """Iterates through server responses and prints them.
+
+    The recognize_stream passed is a generator that will block until a response
+    is provided by the server. When the transcription response comes, print it.
+
+    In this case, responses are provided for interim results as well. If the
+    response is an interim one, print a line feed at the end of it, to allow
+    the next result to overwrite it, until the response is a final one. For the
+    final one, print a newline to preserve the finalized transcription.
+    """
     num_chars_printed = 0
     for resp in recognize_stream:
         if resp.error.code != code_pb2.OK:
@@ -181,18 +182,19 @@ def listen_print_loop(recognize_stream):
 
         # Display interim results, but with a carriage return at the end of the
         # line, so subsequent lines will overwrite them.
-        if not result.is_final:
-            # If the previous result was longer than this one, we need to print
-            # some extra spaces to overwrite the previous result
-            overwrite_chars = ' ' * max(0, num_chars_printed - len(transcript))
+        #
+        # If the previous result was longer than this one, we need to print
+        # some extra spaces to overwrite the previous result
+        overwrite_chars = ' ' * max(0, num_chars_printed - len(transcript))
 
+        if not result.is_final:
             sys.stdout.write(transcript + overwrite_chars + '\r')
             sys.stdout.flush()
 
             num_chars_printed = len(transcript)
 
         else:
-            print(transcript)
+            print(transcript + overwrite_chars)
 
             # Exit recognition if any of the transcribed phrases could be
             # one of our keywords.
@@ -204,28 +206,31 @@ def listen_print_loop(recognize_stream):
 
 
 def main():
-    with cloud_speech.beta_create_Speech_stub(
-            make_channel('speech.googleapis.com', 443)) as service:
-        # For streaming audio from the microphone, there are three threads.
-        # First, a thread that collects audio data as it comes in
-        with record_audio(RATE, CHUNK) as buffered_audio_data:
-            # Second, a thread that sends requests with that data
-            requests = request_stream(buffered_audio_data, RATE)
-            # Third, a thread that listens for transcription responses
-            recognize_stream = service.StreamingRecognize(
-                requests, DEADLINE_SECS)
+    service = cloud_speech_pb2.SpeechStub(
+        make_channel('speech.googleapis.com', 443))
 
-            # Exit things cleanly on interrupt
-            signal.signal(signal.SIGINT, lambda *_: recognize_stream.cancel())
+    # For streaming audio from the microphone, there are three threads.
+    # First, a thread that collects audio data as it comes in
+    with record_audio(RATE, CHUNK) as buffered_audio_data:
+        # Second, a thread that sends requests with that data
+        requests = request_stream(buffered_audio_data, RATE)
+        # Third, a thread that listens for transcription responses
+        recognize_stream = service.StreamingRecognize(
+            requests, DEADLINE_SECS)
 
-            # Now, put the transcription responses to use.
-            try:
-                listen_print_loop(recognize_stream)
+        # Exit things cleanly on interrupt
+        signal.signal(signal.SIGINT, lambda *_: recognize_stream.cancel())
 
-                recognize_stream.cancel()
-            except face.CancellationError:
-                # This happens because of the interrupt handler
-                pass
+        # Now, put the transcription responses to use.
+        try:
+            listen_print_loop(recognize_stream)
+
+            recognize_stream.cancel()
+        except grpc.RpcError as e:
+            code = e.code()
+            # CANCELLED is caused by the interrupt handler, which is expected.
+            if code is not code.CANCELLED:
+                raise
 
 
 if __name__ == '__main__':

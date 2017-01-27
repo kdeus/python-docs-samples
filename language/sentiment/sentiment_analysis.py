@@ -11,36 +11,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-'''Demonstrates how to make a simple call to the Natural Language API'''
+# [START sentiment_tutorial]
+"""Demonstrates how to make a simple call to the Natural Language API."""
 
+# [START sentiment_tutorial_import]
 import argparse
-from googleapiclient import discovery
-from oauth2client.client import GoogleCredentials
+
+from google.cloud import language
+# [END sentiment_tutorial_import]
 
 
-def main(movie_review_filename):
-    '''Run a sentiment analysis request on text within a passed filename.'''
+def print_result(annotations):
+    score = annotations.sentiment.score
+    magnitude = annotations.sentiment.magnitude
 
-    credentials = GoogleCredentials.get_application_default()
-    service = discovery.build('language', 'v1beta1', credentials=credentials)
+    for index, sentence in enumerate(annotations.sentences):
+        sentence_sentiment = sentence.sentiment.score
+        print('Sentence {} has a sentiment score of {}'.format(
+            index, sentence_sentiment))
+
+    print('Overall Sentiment: score of {} with magnitude of {}'.format(
+        score, magnitude))
+    return 0
+
+    print('Sentiment: score of {} with magnitude of {}'.format(
+        score, magnitude))
+    return 0
+
+
+def analyze(movie_review_filename):
+    """Run a sentiment analysis request on text within a passed filename."""
+    language_client = language.Client()
 
     with open(movie_review_filename, 'r') as review_file:
-        service_request = service.documents().analyzeSentiment(
-            body={
-                'document': {
-                    'type': 'PLAIN_TEXT',
-                    'content': review_file.read(),
-                }
-            }
-        )
-        response = service_request.execute()
+        # Instantiates a plain text document.
+        document = language_client.document_from_html(review_file.read())
 
-    polarity = response['documentSentiment']['polarity']
-    magnitude = response['documentSentiment']['magnitude']
+        # Detects sentiment in the document.
+        annotations = document.annotate_text(include_sentiment=True,
+                                             include_syntax=False,
+                                             include_entities=False)
 
-    print('Sentiment: polarity of {} with magnitude of {}'.format(
-        polarity, magnitude))
-    return 0
+        # Print the results
+        print_result(annotations)
 
 
 if __name__ == '__main__':
@@ -51,4 +64,6 @@ if __name__ == '__main__':
         'movie_review_filename',
         help='The filename of the movie review you\'d like to analyze.')
     args = parser.parse_args()
-    main(args.movie_review_filename)
+
+    analyze(args.movie_review_filename)
+# [END sentiment_tutorial]

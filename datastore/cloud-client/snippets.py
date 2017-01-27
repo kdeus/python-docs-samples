@@ -362,9 +362,12 @@ def cursor_paging(client):
     def get_one_page_of_tasks(cursor=None):
         query = client.query(kind='Task')
         query_iter = query.fetch(start_cursor=cursor, limit=5)
-        tasks, _, cursor = query_iter.next_page()
+        page = next(query_iter.pages)
 
-        return tasks, cursor
+        tasks = list(page)
+        next_cursor = query_iter.next_page_token
+
+        return tasks, next_cursor
     # [END cursor_paging]
 
     page_one, cursor_one = get_one_page_of_tasks()
@@ -665,8 +668,11 @@ def transactional_update(client):
     for _ in range(5):
         try:
             transfer_funds(client, account1.key, account2.key, 50)
+            break
         except google.cloud.exceptions.Conflict:
             continue
+    else:
+        print('Trasaction failed.')
     # [END transactional_retry]
 
     return account1.key, account2.key

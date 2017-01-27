@@ -20,11 +20,8 @@ def run_quickstart():
     # Imports the Google Cloud client library
     from google.cloud import translate
 
-    # Your Translate API key
-    api_key = 'YOUR_API_KEY'
-
     # Instantiates a client
-    translate_client = translate.Client(api_key)
+    translate_client = translate.Client()
 
     # The text to translate
     text = u'Hello, world!'
@@ -32,7 +29,9 @@ def run_quickstart():
     target = 'ru'
 
     # Translates some text into Russian
-    translation = translate_client.translate(text, target_language=target)
+    translation = translate_client.translate(
+        text,
+        target_language=target)
 
     print(u'Text: {}'.format(text))
     print(u'Translation: {}'.format(translation['translatedText']))

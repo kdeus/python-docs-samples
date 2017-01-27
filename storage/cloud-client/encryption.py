@@ -32,6 +32,7 @@ import base64
 import os
 
 from google.cloud import storage
+from google.cloud.storage import Blob
 
 
 def generate_encryption_key():
@@ -57,15 +58,13 @@ def upload_encrypted_blob(bucket_name, source_file_name,
     """
     storage_client = storage.Client()
     bucket = storage_client.get_bucket(bucket_name)
-    blob = bucket.blob(destination_blob_name)
-
     # Encryption key must be an AES256 key represented as a bytestring with
     # 32 bytes. Since it's passed in as a base64 encoded string, it needs
     # to be decoded.
     encryption_key = base64.b64decode(base64_encryption_key)
+    blob = Blob(destination_blob_name, bucket, encryption_key=encryption_key)
 
-    blob.upload_from_filename(
-        source_file_name, encryption_key=encryption_key)
+    blob.upload_from_filename(source_file_name)
 
     print('File {} uploaded to {}.'.format(
         source_file_name,
@@ -81,15 +80,13 @@ def download_encrypted_blob(bucket_name, source_blob_name,
     """
     storage_client = storage.Client()
     bucket = storage_client.get_bucket(bucket_name)
-    blob = bucket.blob(source_blob_name)
-
     # Encryption key must be an AES256 key represented as a bytestring with
     # 32 bytes. Since it's passed in as a base64 encoded string, it needs
     # to be decoded.
     encryption_key = base64.b64decode(base64_encryption_key)
+    blob = Blob(source_blob_name, bucket, encryption_key=encryption_key)
 
-    blob.download_to_filename(
-        destination_file_name, encryption_key=encryption_key)
+    blob.download_to_filename(destination_file_name)
 
     print('Blob {} downloaded to {}.'.format(
         source_blob_name,
@@ -100,8 +97,27 @@ def rotate_encryption_key(bucket_name, blob_name, base64_encryption_key,
                           base64_new_encryption_key):
     """Performs a key rotation by re-writing an encrypted blob with a new
     encryption key."""
-    raise NotImplementedError(
-        'This is currently not available using the Cloud Client Library.')
+    storage_client = storage.Client()
+    bucket = storage_client.get_bucket(bucket_name)
+    current_encryption_key = base64.b64decode(base64_encryption_key)
+    new_encryption_key = base64.b64decode(base64_new_encryption_key)
+
+    # Both source_blob and destination_blob refer to the same storage object,
+    # but destination_blob has the new encryption key.
+    source_blob = Blob(
+        blob_name, bucket, encryption_key=current_encryption_key)
+    destination_blob = Blob(
+        blob_name, bucket, encryption_key=new_encryption_key)
+
+    token = None
+
+    while True:
+        token, bytes_rewritten, total_bytes = destination_blob.rewrite(
+            source_blob, token=token)
+        if token is None:
+            break
+
+    print('Key rotation complete for Blob {}'.format(blob_name))
 
 
 if __name__ == '__main__':
@@ -133,9 +149,9 @@ if __name__ == '__main__':
         'rotate', help=rotate_encryption_key.__doc__)
     rotate_parser.add_argument(
         'bucket_name', help='Your cloud storage bucket.')
-    download_parser.add_argument('blob_name')
-    download_parser.add_argument('base64_encryption_key')
-    download_parser.add_argument('base64_new_encryption_key')
+    rotate_parser.add_argument('blob_name')
+    rotate_parser.add_argument('base64_encryption_key')
+    rotate_parser.add_argument('base64_new_encryption_key')
 
     args = parser.parse_args()
 
